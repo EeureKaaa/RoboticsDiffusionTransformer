@@ -51,6 +51,7 @@ def process_hdf5_dataset(vla_dataset):
             state_min = np.minimum(state_min, np.min(states, axis=0))
     
     # Add one to avoid division by zero
+    print("nz_state_cnt:", nz_state_cnt)
     nz_state_cnt = np.maximum(nz_state_cnt, np.ones_like(nz_state_cnt))
     
     result = {
@@ -79,6 +80,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
     
     vla_dataset = HDF5VLADataset()
+    print(f"Number of episodes: {len(vla_dataset)}")
     dataset_name = vla_dataset.get_dataset_name()
     
     try:

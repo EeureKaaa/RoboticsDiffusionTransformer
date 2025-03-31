@@ -38,6 +38,7 @@ from models.multimodal_encoder.t5_encoder import T5Embedder
 from models.rdt_runner import RDTRunner
 from train.dataset import DataCollatorForVLAConsumerDataset, VLAConsumerDataset
 from train.sample import log_sample_res
+from tqdm import tqdm
 
 
 if is_wandb_available():
@@ -72,6 +73,34 @@ This is a RDT model derived from {base_model}. The weights were trained using [R
         f.write(yaml + model_card)
 
 
+GLOBAL_ID_DICT = {}
+
+
+def process_text(batch, encoder, weight_dtype, lang_attn_masks):
+    ids = batch['input_ids']
+    total_embeds = []
+    for input_id, lang_attn_mask in zip(ids, lang_attn_masks):
+        input_ids_key = tuple(input_id.flatten().tolist())
+        # 检查是否已经缓存了这个 input_ids 的 text_embeds
+        if input_ids_key in GLOBAL_ID_DICT:
+            # 如果存在，直接从缓存中取值
+            text_embeds = GLOBAL_ID_DICT[input_ids_key]
+        else:
+            # 如果不存在，计算 text_embeds 并存入缓存
+            print('****** inputids', input_id.shape, lang_attn_mask.shape)
+            print('****** after unsqueeze', input_id.unsqueeze(0).shape,
+                  lang_attn_mask.unsqueeze(0).shape)
+            lang_attn_mask = batch["lang_attn_mask"].to(dtype=weight_dtype)
+            text_embeds = encoder(
+                input_ids=input_id.unsqueeze(0), attention_mask=lang_attn_mask.unsqueeze(0)).last_hidden_state.detach()[0, :]
+            GLOBAL_ID_DICT[input_ids_key] = text_embeds  # 存入缓存
+
+        total_embeds.append(text_embeds)
+
+    print('-------- global_dict', GLOBAL_ID_DICT)
+    return torch.stack(total_embeds, dim=0).to(weight_dtype).to(ids.device)
+
+
 def train(args, logger):
     # Read the config
     with open(args.config_path, "r") as fp:
@@ -79,7 +108,8 @@ def train(args, logger):
 
     logging_dir = Path(args.output_dir, args.logging_dir)
 
-    accelerator_project_config = ProjectConfiguration(total_limit=args.checkpoints_total_limit)
+    accelerator_project_config = ProjectConfiguration(
+        total_limit=args.checkpoints_total_limit)
     accelerator = Accelerator(
         deepspeed_plugin=DeepSpeedPlugin(
             hf_ds_config=args.deepspeed
@@ -93,7 +123,8 @@ def train(args, logger):
 
     if args.report_to == "wandb":
         if not is_wandb_available():
-            raise ImportError("Make sure to install wandb if you want to use it for logging during training.")
+            raise ImportError(
+                "Make sure to install wandb if you want to use it for logging during training.")
 
     # Make one log on every process with the configuration for debugging.
     logging.basicConfig(
@@ -130,15 +161,16 @@ def train(args, logger):
         weight_dtype = torch.float16
     elif accelerator.mixed_precision == "bf16":
         weight_dtype = torch.bfloat16
-    
+
     if args.precomp_lang_embed:
         tokenizer, text_encoder = None, None
     else:
-        text_embedder = T5Embedder(from_pretrained=args.pretrained_text_encoder_name_or_path, 
-                                model_max_length=config["dataset"]["tokenizer_max_length"], device=accelerator.device)
+        text_embedder = T5Embedder(from_pretrained=args.pretrained_text_encoder_name_or_path,
+                                   model_max_length=config["dataset"]["tokenizer_max_length"], device=accelerator.device)
         tokenizer, text_encoder = text_embedder.tokenizer, text_embedder.model
 
-    vision_encoder = SiglipVisionTower(vision_tower=args.pretrained_vision_encoder_name_or_path, args=None)
+    vision_encoder = SiglipVisionTower(
+        vision_tower=args.pretrained_vision_encoder_name_or_path, args=None)
     image_processor = vision_encoder.image_processor
 
     # Load from a pretrained checkpoint
@@ -151,8 +183,8 @@ def train(args, logger):
     else:
         logger.info("Constructing model from provided config.")
         # Calculate the image condition length
-        img_cond_len = (config["common"]["img_history_size"] 
-                        * config["common"]["num_cameras"] 
+        img_cond_len = (config["common"]["img_history_size"]
+                        * config["common"]["num_cameras"]
                         * vision_encoder.num_patches)
         rdt = RDTRunner(
             action_dim=config["common"]["state_dim"],
@@ -166,9 +198,9 @@ def train(args, logger):
             img_pos_embed_config=[
                 # No initial pos embed in the last grid size
                 # since we've already done in ViT
-                ("image", (config["common"]["img_history_size"], 
-                    config["common"]["num_cameras"], 
-                    -vision_encoder.num_patches)),  
+                ("image", (config["common"]["img_history_size"],
+                           config["common"]["num_cameras"],
+                           -vision_encoder.num_patches)),
             ],
             lang_pos_embed_config=[
                 # Similarly, no initial pos embed for language
@@ -176,8 +208,7 @@ def train(args, logger):
             ],
             dtype=weight_dtype,
         )
-        
-                                                                       
+
     ema_rdt = copy.deepcopy(rdt)
     ema_model = EMAModel(
         ema_rdt,
@@ -193,15 +224,17 @@ def train(args, logger):
     def save_model_hook(models, weights, output_dir):
         if accelerator.is_main_process:
             for model in models:
-                model_to_save = model.module if hasattr(model, "module") else model  # type: ignore
+                model_to_save = model.module if hasattr(
+                    model, "module") else model  # type: ignore
                 if isinstance(model_to_save, type(accelerator.unwrap_model(rdt))):
                     model_to_save.save_pretrained(output_dir)
 
     accelerator.register_save_state_pre_hook(save_model_hook)
-    
+
     if args.gradient_checkpointing:
-        # TODO: 
-        raise NotImplementedError("Gradient checkpointing is not yet implemented.")
+        # TODO:
+        raise NotImplementedError(
+            "Gradient checkpointing is not yet implemented.")
 
     # Enable TF32 for faster training on Ampere GPUs,
     # cf https://pytorch.org/docs/stable/notes/cuda.html#tensorfloat-32-tf32-on-ampere-devices
@@ -210,7 +243,8 @@ def train(args, logger):
 
     if args.scale_lr:
         args.learning_rate = (
-            args.learning_rate * args.gradient_accumulation_steps * args.train_batch_size * accelerator.num_processes
+            args.learning_rate * args.gradient_accumulation_steps *
+            args.train_batch_size * accelerator.num_processes
         )
 
     # Use 8-bit Adam for lower memory usage or to fine-tune the model in 16GB GPUs
@@ -235,8 +269,8 @@ def train(args, logger):
         weight_decay=args.adam_weight_decay,
         eps=args.adam_epsilon,
     )
-    
-    # Dataset and DataLoaders creation:                                                           
+
+    # Dataset and DataLoaders creation:
     train_dataset = VLAConsumerDataset(
         config=config["dataset"],
         tokenizer=tokenizer,
@@ -264,10 +298,10 @@ def train(args, logger):
         state_noise_snr=None,
         use_hdf5=args.load_from_hdf5,
         use_precomp_lang_embed=args.precomp_lang_embed,
-    )                              
-    
-    data_collator = DataCollatorForVLAConsumerDataset(tokenizer)                                                        
-    
+    )
+
+    data_collator = DataCollatorForVLAConsumerDataset(tokenizer)
+
     train_dataloader = torch.utils.data.DataLoader(
         train_dataset,
         batch_size=args.train_batch_size,
@@ -286,10 +320,10 @@ def train(args, logger):
         pin_memory=True,
         persistent_workers=True
     )
-    
     # Scheduler and math around the number of training steps.
     overrode_max_train_steps = False
-    num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
+    num_update_steps_per_epoch = math.ceil(
+        len(train_dataloader) / args.gradient_accumulation_steps)
     if args.max_train_steps is None:
         args.max_train_steps = args.num_train_epochs * num_update_steps_per_epoch
         overrode_max_train_steps = True
@@ -305,46 +339,53 @@ def train(args, logger):
 
     # Prepare everything with our `accelerator`.
     rdt, optimizer, train_dataloader, sample_dataloader, lr_scheduler = accelerator.prepare(
-        rdt, optimizer, train_dataloader, sample_dataloader, lr_scheduler                   
+        rdt, optimizer, train_dataloader, sample_dataloader, lr_scheduler
     )
 
-    ema_rdt.to(accelerator.device, dtype=weight_dtype)                                                                             
+    ema_rdt.to(accelerator.device, dtype=weight_dtype)
 
     if text_encoder is not None:
         text_encoder.to(accelerator.device, dtype=weight_dtype)
-    
+
     if vision_encoder is not None:
         vision_encoder.vision_tower.to(accelerator.device, dtype=weight_dtype)
 
     # We need to recalculate our total training steps as the size of the training dataloader may have changed.
-    num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
+    num_update_steps_per_epoch = math.ceil(
+        len(train_dataloader) / args.gradient_accumulation_steps)
     if overrode_max_train_steps:
         args.max_train_steps = args.num_train_epochs * num_update_steps_per_epoch
     # Afterwards we recalculate our number of training epochs
-    args.num_train_epochs = math.ceil(args.max_train_steps / num_update_steps_per_epoch)
+    args.num_train_epochs = math.ceil(
+        args.max_train_steps / num_update_steps_per_epoch)
 
     # We need to initialize the trackers we use, and also store our configuration.
     # The trackers initializes automatically on the main process.
     if accelerator.is_main_process:
-        accelerator.init_trackers("roboticDiffusionTransformer", config=vars(args))
+        accelerator.init_trackers(
+            "roboticDiffusionTransformer", config=vars(args))
 
     # Train!
-    total_batch_size = args.train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps
+    total_batch_size = args.train_batch_size * \
+        accelerator.num_processes * args.gradient_accumulation_steps
 
     logger.info("***** Running training *****")
     logger.info(f"  Num examples = {len(train_dataset)}")
     logger.info(f"  Num batches each epoch = {len(train_dataloader)}")
     logger.info(f"  Num Epochs = {args.num_train_epochs}")
-    logger.info(f"  Instantaneous batch size per device = {args.train_batch_size}")
-    logger.info(f"  Total train batch size (w. parallel, distributed & accumulation) = {total_batch_size}")
-    logger.info(f"  Gradient Accumulation steps = {args.gradient_accumulation_steps}")
+    logger.info(
+        f"  Instantaneous batch size per device = {args.train_batch_size}")
+    logger.info(
+        f"  Total train batch size (w. parallel, distributed & accumulation) = {total_batch_size}")
+    logger.info(
+        f"  Gradient Accumulation steps = {args.gradient_accumulation_steps}")
     logger.info(f"  Total optimization steps = {args.max_train_steps}")
     global_step = 0
     first_epoch = 0
-    
+
     # Load from a pretrained checkpoint
     if (
-        args.resume_from_checkpoint is None 
+        args.resume_from_checkpoint is None
         and args.pretrained_model_name_or_path is not None
         and os.path.isfile(args.pretrained_model_name_or_path)
     ):
@@ -352,7 +393,7 @@ def train(args, logger):
         logger.info("Loading from a pretrained checkpoint.")
         checkpoint = torch.load(args.pretrained_model_name_or_path)
         rdt.module.load_state_dict(checkpoint["module"])
-   
+
     # Potentially load in the weights and states from a previous save
     if args.resume_from_checkpoint:
         if args.resume_from_checkpoint != "latest":
@@ -372,57 +413,83 @@ def train(args, logger):
         else:
             accelerator.print(f"Resuming from checkpoint {path}")
             try:
-                accelerator.load_state(os.path.join(args.output_dir, path)) # load_module_strict=False
+                # load_module_strict=False
+                accelerator.load_state(os.path.join(args.output_dir, path))
             except:
                 # load deepspeed's state_dict
-                logger.info("Resuming training state failed. Attempting to only load from model checkpoint.")
-                checkpoint = torch.load(os.path.join(args.output_dir, path, "pytorch_model", "mp_rank_00_model_states.pt"))
+                logger.info(
+                    "Resuming training state failed. Attempting to only load from model checkpoint.")
+                checkpoint = torch.load(os.path.join(
+                    args.output_dir, path, "pytorch_model", "mp_rank_00_model_states.pt"))
                 rdt.module.load_state_dict(checkpoint["module"])
-                
-            load_model(ema_rdt, os.path.join(args.output_dir, path, "ema", "model.safetensors"))
+
+            load_model(ema_rdt, os.path.join(
+                args.output_dir, path, "ema", "model.safetensors"))
             global_step = int(path.split("-")[1])
 
             resume_global_step = global_step * args.gradient_accumulation_steps
             first_epoch = global_step // num_update_steps_per_epoch
-            resume_step = resume_global_step % (num_update_steps_per_epoch * args.gradient_accumulation_steps)
+            resume_step = resume_global_step % (
+                num_update_steps_per_epoch * args.gradient_accumulation_steps)
 
     # Only show the progress bar once on each machine.
-    progress_bar = tqdm(range(global_step, args.max_train_steps), disable=not accelerator.is_local_main_process)
+    progress_bar = tqdm(range(global_step, args.max_train_steps),
+                        disable=not accelerator.is_local_main_process)
     progress_bar.set_description("Steps")
 
+    text_embeds_cache = {}  # 用来存储 input_ids 和对应的 text_embed
     loss_for_log = {}
+    ttmmp_text = torch.load('./text_embeds.pt')
     for epoch in range(first_epoch, args.num_train_epochs):
 
         rdt.train()
-        
+
         # Set the progress_bar to correct position
         if args.resume_from_checkpoint and epoch == first_epoch:
-            progress_bar.update(resume_step // args.gradient_accumulation_steps)
-        
+            progress_bar.update(
+                resume_step // args.gradient_accumulation_steps)
+
+        for batch in tqdm(train_dataloader, desc="debuging dataloader"):
+            continue
+
         # Forward and backward...
         for batch in train_dataloader:
+            # print('------', batch['input_ids'], batch['lang_attn_mask'], batch['input_ids'].shape)
             with accelerator.accumulate(rdt):
                 images = batch["images"].to(dtype=weight_dtype)
-                states = batch["states"].to(dtype=weight_dtype) # (B, T, D_a)
+                states = batch["states"].to(dtype=weight_dtype)  # (B, T, D_a)
+                # B, T, D_a = states.shape
                 # We only use the last state as input
                 states = states[:, -1:, :]
                 actions = batch["actions"].to(dtype=weight_dtype)
-                state_elem_mask = batch["state_elem_mask"].to(dtype=weight_dtype)
+                state_elem_mask = batch["state_elem_mask"].to(
+                    dtype=weight_dtype)
                 ctrl_freqs = batch["ctrl_freqs"]
-                    
+
                 with torch.no_grad():
                     batch_size, _, C, H, W = images.shape
-                    image_embeds = vision_encoder(images.reshape(-1, C, H, W)).detach()
-                    image_embeds = image_embeds.reshape((batch_size, -1, vision_encoder.hidden_size))
+                    image_embeds = vision_encoder(
+                        images.reshape(-1, C, H, W)).detach()
+                    image_embeds = image_embeds.reshape(
+                        (batch_size, -1, vision_encoder.hidden_size))
 
                     lang_attn_mask = batch["lang_attn_mask"]
-                    text_embeds = batch["lang_embeds"].to(dtype=weight_dtype) \
-                        if args.precomp_lang_embed \
-                        else text_encoder(
-                            input_ids=batch["input_ids"],
-                            attention_mask=lang_attn_mask
-                        )["last_hidden_state"].detach()
-                
+                    # text_embeds = batch["lang_embeds"].to(dtype=weight_dtype) \
+                    #     if args.precomp_lang_embed \
+                    #     else text_encoder(
+                    #         input_ids=batch["input_ids"],
+                    #         attention_mask=lang_attn_mask
+                    # )["last_hidden_state"].detach()
+                    # torch.save(text_embeds,'text_embeds.pt')
+                    #
+                    text_embeds = ttmmp_text.to(lang_attn_mask.device)
+                    # print('-----after_process', text_embeds, text_embeds.shape)
+                    #
+                    # breakpoint()
+                    # text_embeds = process_text(
+                    #     batch, text_encoder, weight_dtype, lang_attn_mask)
+                    #
+                    # print('------******* procesed text', text_embeds.shape)
                 state_elem_mask = state_elem_mask.unsqueeze(1)
                 loss = rdt(
                     lang_tokens=text_embeds,
@@ -437,11 +504,12 @@ def train(args, logger):
                 accelerator.backward(loss)
                 if accelerator.sync_gradients:
                     params_to_clip = rdt.parameters()
-                    accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
+                    accelerator.clip_grad_norm_(
+                        params_to_clip, args.max_grad_norm)
                 optimizer.step()
                 lr_scheduler.step()
                 optimizer.zero_grad(set_to_none=args.set_grads_to_none)
-            
+
             ema_model.step(accelerator.unwrap_model(rdt))
 
             # Checks if the accelerator has performed an optimization step behind the scenes
@@ -450,7 +518,8 @@ def train(args, logger):
                 global_step += 1
 
                 if global_step % args.checkpointing_period == 0:
-                    save_path = os.path.join(args.output_dir, f"checkpoint-{global_step}")
+                    save_path = os.path.join(
+                        args.output_dir, f"checkpoint-{global_step}")
                     accelerator.save_state(save_path)
                     ema_save_path = os.path.join(save_path, f"ema")
                     accelerator.save_model(ema_rdt, ema_save_path)
@@ -471,7 +540,8 @@ def train(args, logger):
                     logger.info(sample_loss_for_log)
                     accelerator.log(sample_loss_for_log, step=global_step)
 
-            logs = {"loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
+            logs = {"loss": loss.detach().item(
+            ), "lr": lr_scheduler.get_last_lr()[0]}
             progress_bar.set_postfix(**logs)
             logs.update(loss_for_log)
             # logger.info(logs)
@@ -486,7 +556,7 @@ def train(args, logger):
         accelerator.unwrap_model(rdt).save_pretrained(args.output_dir)
         ema_save_path = os.path.join(args.output_dir, f"ema")
         accelerator.save_model(ema_rdt, ema_save_path)
-        
+
         logger.info(f"Saved Model to {args.output_dir}")
 
         if args.push_to_hub:
@@ -503,5 +573,5 @@ def train(args, logger):
                 allow_patterns=["pytorch_model.bin", "*.json", "*.md"],
                 # ignore_patterns=["step_*", "epoch_*"],
             )
-            
+
     accelerator.end_training()

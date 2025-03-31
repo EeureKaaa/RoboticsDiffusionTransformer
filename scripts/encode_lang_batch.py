@@ -8,7 +8,7 @@ from tqdm import tqdm
 from models.multimodal_encoder.t5_encoder import T5Embedder
 
 
-GPU = 0
+GPU = 4
 MODEL_PATH = "google/t5-v1_1-xxl"
 CONFIG_PATH = "configs/base.yaml"
 # Modify the TARGET_DIR to your dataset path
